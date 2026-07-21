@@ -1,0 +1,555 @@
+#pragma exclude_renderers metal
+
+#pragma kernel ClearAccumCS
+#pragma kernel ClearPersistentCS
+#pragma kernel SplatCS
+#pragma kernel ResolveFuseCS
+#pragma kernel StabilityReduceCS
+#pragma kernel CopyHeightMuCS
+
+#define PI 3.14159265359
+#define INF 3.402823e+38
+
+// Meta global variables
+Texture2DArray _EnvironmentDepthTexture;
+// Preprocessed depth (encoding: R = 1-minAvg, G = 1-maxAvg, B = avg-minAvg, A = maxAvg-minAvg)
+Texture2DArray _PreprocessedEnvironmentDepthTexture;
+float4x4 _EnvironmentDepthReprojectionMatrices[2];
+
+// TeAPOT global variables
+uint2 _DepthTextureSize;
+float4x4 _InvDepthReprojectionMatrices[2];
+
+// Input
+float4x4 _WorldToPlaneMatrix; // world->plane object
+float3 _PlaneOrigin;
+float3 _PlaneNormal;
+float3 _PlaneRight;
+float3 _PlaneForward;
+
+// Transient accumulators
+RWTexture2D<uint> _AccumW;      // Σ w (fixed point)
+RWTexture2D<int>  _AccumHW;     // Σ h·w (fixed point)
+RWTexture2D<uint> _AccumCosW;   // Σ cos·w (fixed point)
+
+// Outputs
+RWTexture2D<float> _OutKnown;   // 1 if known, 0 if unknown
+
+// Temporal fusion state (world-locked height map)
+RWTexture2D<float> _HeightW;    // cumulative temporal weight
+RWTexture2D<float> _HeightMu;   // fused mean height (meters)
+
+// Stability reduce
+RWTexture2D<float> _HeightMuPrev;   // previous fused mean (meters)
+RWStructuredBuffer<uint> _Stats;    // uint[2]: 0 = knownCount, 1 = maxDelta_fp
+
+// Param
+uint _eye; // array slice
+
+// Plane grid definition
+float   _uMin;
+float   _vMin;
+float2  _cellSize;  // meters per cell
+float   _cellArea;  // square meters per cell
+uint    _gridW;     // number of cells along U
+uint    _gridH;     // number of cells along V
+
+// Inverse-ellipse / EWA
+float  _gaussTau;   // Gaussian spread in ellipse (0 = flat)
+
+// Fixed-point scales
+uint   _wScale;     // e.g., 65536
+uint   _hwScale;    // e.g., 65536
+
+// Temporal fusion parameters
+float _SigmaMeas;         // measurement stddev (meters), e.g., 0.03
+float _SigmaFloor;        // additive floor stddev (meters), e.g., 0.01
+float _ProcessNoiseQ;     // process noise (m^2 per second), e.g., 0.005
+float _GateTau;           // Mahalanobis gate (e.g., 2.8)
+float _HuberK;            // Huber k-sigma (e.g., 1.8)
+float _DecayLambda;       // confidence decay rate (s^-1), e.g., 0.4
+float _Vmax;              // max allowed vertical speed (m/s), e.g., 0.3
+
+// Stability reduce
+float _ConfThresh;    // e.g., 0.5
+float _DeltaScale;    // e.g., 10000 (1 unit = 0.0001 m)
+float _VarScale;      // e.g., 1e6   (1 unit = 1e-6 m^2)
+
+groupshared uint g_valid;
+groupshared uint g_covered;
+groupshared uint g_sumVar_fp;
+groupshared uint g_maxDelta_fp;
+
+// ---------- Helpers ----------
+
+float2 NDC(uint2 px)
+{
+    //  Convert source pixel center to normalized UV in [0, 1]^2.
+    //  +0.5 -> sample at pixel center; division handles int/float correctly.
+
+    //  Map texture space to Normalized Device Coordinates (NDC).
+    //  uv in [0, 1] -> ndc.xy in [-1, 1]
+    //  d  in [0, 1] -> ndc.z  in [-1, 1]
+    float2 uv = ((float2)px + 0.5) / (float2)_DepthTextureSize;
+    return uv * 2.0 - 1.0;
+}
+
+float3 NDC(uint2 px, float depth01)
+{
+    //  Convert source pixel center to normalized UV in [0, 1]^2.
+    //  +0.5 -> sample at pixel center; division handles int/float correctly.
+
+    //  Map texture space to Normalized Device Coordinates (NDC).
+    //  uv in [0, 1] -> ndc.xy in [-1, 1]
+    //  d  in [0, 1] -> ndc.z  in [-1, 1]
+    float2 uv = ((float2)px + 0.5) / (float2)_DepthTextureSize;
+    return float3(uv, depth01) * 2.0 - 1.0;
+}
+
+float3 WorldFromClip(float4 clip, uint eye)
+{
+    //  Unproject/reproject: clip -> world.
+    //  _InvDepthReprojectionMatrices[eye] map this clip/NDC point into world space.
+    //  The result is homogeneous; divide by w to get a 3D point.
+    float4 world = mul(_InvDepthReprojectionMatrices[eye], clip);
+    return world.xyz / world.w;
+}
+
+// Project a world point to plane coords (u, v, h)
+void WorldToPlane(float3 p, out float u, out float h, out float v)
+{
+    float4 uvh = mul(_WorldToPlaneMatrix, float4(p, 1.0));
+
+    u = uvh.x;
+    h = uvh.y;
+    v = uvh.z;
+}
+
+// ∂P/∂(z_ndc) at fixed pixel (u, v) using finite differences in NDC z
+float3 dp_dz_center(uint2 px, float ndcZ, float dZ_)
+{
+    const float guard = 1e-6;
+    const float zMin = -1.0 + guard;
+    const float zMax =  1.0 - guard;
+
+    float z0, z1; // endpoints for the derivative
+    float dz;     // actual step used
+
+    // Use central diff away from the ends, otherwise one-sided
+    if (ndcZ - dZ_ >= zMin && ndcZ + dZ_ <= zMax)
+    {
+        z0 = ndcZ - dZ_;
+        z1 = ndcZ + dZ_;
+        dz = (z1 - z0); // = 2*dZ
+    }
+    else if (ndcZ + dZ_ <= zMax)
+    {
+        // forward diff
+        z0 = ndcZ;
+        z1 = ndcZ + dZ_;
+        dz = (z1 - z0);
+    }
+    else
+    {
+        // backward diff
+        z0 = ndcZ - dZ_;
+        z1 = ndcZ;
+        dz = (z1 - z0);
+    }
+
+    // Build NDC XY at this pixel (fixed u, v)
+    float2 ndc = NDC(px);
+
+    // Unproject both points (invVP * clip, then divide by w)
+    float3 p0 = WorldFromClip(float4(ndc, z0, 1.0), _eye);
+    float3 p1 = WorldFromClip(float4(ndc, z1, 1.0), _eye);
+
+    return (p1 - p0) / dz; // world units per NDC unit
+}
+
+float3 dp_dz_analytic(float3 ndc)
+{
+    float4x4 mat = _InvDepthReprojectionMatrices[_eye];
+
+    // Build NDC 4-vector
+    float4 v = float4(ndc, 1.0);
+
+    // world4 = M * v
+    float4 w4 = mul(mat, v);
+
+    // column 2 of M (indexing 0-based): contributes d(world4)/dz_ndc
+    float4 m2 = float4(mat._13, mat._23, mat._33, mat._43);
+
+    // dP/dz = (m2.xyz * w4.w - w4.xyz * m2.w) / (w4.w)^2
+    float denom = max(w4.w * w4.w, 1e-20);
+    return (m2.xyz * w4.w - w4.xyz * m2.w) / denom;
+}
+
+void dz_du_dv(uint2 px, out float dz_du, out float dz_dv)
+{
+    int x = px.x, y = px.y;
+
+    // Fetch depth01 ∈ [0,1]
+    float z01C = _EnvironmentDepthTexture.Load(int4(px, _eye, 0)).r;
+    float z01L = (x > 0                      ) ? _EnvironmentDepthTexture.Load(int4(uint2(x - 1, y), _eye, 0)).r : z01C;
+    float z01R = (x + 1 < _DepthTextureSize.x) ? _EnvironmentDepthTexture.Load(int4(uint2(x + 1, y), _eye, 0)).r : z01C;
+    float z01D = (y > 0                      ) ? _EnvironmentDepthTexture.Load(int4(uint2(x, y - 1), _eye, 0)).r : z01C;
+    float z01U = (y + 1 < _DepthTextureSize.y) ? _EnvironmentDepthTexture.Load(int4(uint2(x, y + 1), _eye, 0)).r : z01C;
+
+    // Convert to NDC z in [-1,1]
+    float zC = 2 * z01C - 1, zL = 2 * z01L - 1, zR = 2 * z01R - 1, zD = 2 * z01D - 1, zU = 2 * z01U - 1;
+
+    // du: central if interior, else forward/backward with 1 px step
+    if (x > 0 && x + 1 < _DepthTextureSize.x) {
+        dz_du = 0.5 * (zR - zL);          // 2 px span → divide by 2
+    } else if (x + 1 < _DepthTextureSize.x) {
+        dz_du = (zR - zC);                // forward 1 px
+    } else { // x == W-1
+        dz_du = (zC - zL);                // backward 1 px
+    }
+
+    // dv: central if interior, else forward/backward with 1 px step
+    if (y > 0 && y + 1 < _DepthTextureSize.y) {
+        dz_dv = 0.5 * (zU - zD);
+    } else if (y + 1 < _DepthTextureSize.y) {
+        dz_dv = (zU - zC);
+    } else { // y == H-1
+        dz_dv = (zC - zD);
+    }
+}
+
+// Image-step at constant depth (CDN term)
+float3 dp_du_constZ(uint2 px, float ndcZ, int h)
+{
+    h = max(1, abs(h));
+    int x = int(px.x);
+
+    uint2 p0, p1;  // sample pixels
+    float  stepPx; // divisor in pixels
+
+    if (x - h >= 0 && x + h < _DepthTextureSize.x)
+    {
+        // central difference
+        p0 = uint2(x - h, px.y);
+        p1 = uint2(x + h, px.y);
+        stepPx = float(2 * h);
+    }
+    else if (x + h < _DepthTextureSize.x)
+    {
+        // forward difference
+        p0 = px;
+        p1 = uint2(x + h, px.y);
+        stepPx = float(h);
+    }
+    else
+    {
+        // backward difference
+        p0 = uint2(x - h, px.y);
+        p1 = px;
+        stepPx = float(h);
+    }
+
+    float2 ndc0 = NDC(p0);
+    float2 ndc1 = NDC(p1);
+
+    float3 pw0 = WorldFromClip(float4(ndc0, ndcZ, 1.0), _eye);
+    float3 pw1 = WorldFromClip(float4(ndc1, ndcZ, 1.0), _eye);
+
+    return (pw1 - pw0) / stepPx;   // [world / pixel]
+}
+
+float3 dp_dv_constZ(uint2 px, float ndcZ, int h)
+{
+    h = max(1, abs(h));
+    int y = int(px.y);
+
+    uint2 p0, p1;  // sample pixels
+    float  stepPy; // divisor in pixels
+
+    if (y - h >= 0 && y + h < _DepthTextureSize.y)
+    {
+        // central difference
+        p0 = uint2(px.x, y - h);
+        p1 = uint2(px.x, y + h);
+        stepPy = float(2 * h);
+    }
+    else if (y + h < _DepthTextureSize.y)
+    {
+        // forward difference
+        p0 = px;
+        p1 = uint2(px.x, y + h);
+        stepPy = float(h);
+    }
+    else
+    {
+        // backward difference
+        p0 = uint2(px.x, y - h);
+        p1 = px;
+        stepPy = float(h);
+    }
+
+    float2 ndc0 = NDC(p0);   // same zC
+    float2 ndc1 = NDC(p1);
+
+    float3 pw0 = WorldFromClip(float4(ndc0, ndcZ, 1.0), _eye);
+    float3 pw1 = WorldFromClip(float4(ndc1, ndcZ, 1.0), _eye);
+
+    return (pw1 - pw0) / stepPy;   // [world / pixel]
+}
+
+// decompose each axis into (normal, tangent), shrink, then recompose
+float2 shrink_axis(float2 v, float2 n_hat, float2 t_hat, float s_n, float s_t)
+{
+    float vn = dot(v, n_hat);
+    float vt = dot(v, t_hat);
+    return s_n * vn * n_hat + s_t * vt * t_hat;
+}
+
+// ---------- CLEAR KERNEL ----------
+[numthreads(8, 8, 1)]
+void ClearAccumCS(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x >= _gridW || tid.y >= _gridH) return;
+    uint2 ij = tid.xy;
+
+    _AccumW[ij]  = 0u;
+    _AccumHW[ij] = 0;
+    _AccumCosW[ij] = 0u;
+}
+
+[numthreads(8, 8, 1)]
+void ClearPersistentCS(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x >= _gridW || tid.y >= _gridH) return;
+    uint2 ij = tid.xy;
+
+    _HeightW[ij] = 0.0;
+    _HeightMu[ij] = 0.0;
+}
+
+// ---------- SPLAT KERNEL ----------
+[numthreads(8, 8, 1)]
+void SplatCS(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x >= _DepthTextureSize.x || tid.y >= _DepthTextureSize.y) return;
+    uint2 px = tid.xy;
+
+    // Raw depth sample -> world position
+    float z = _EnvironmentDepthTexture.Load(int4(px, _eye, 0)).r;
+    if (z < 0.0 || z > 1.0) return;
+
+    float3 ndc = NDC(px, z);
+
+    // World position of center at this GPU depth
+    float3 p = WorldFromClip(float4(ndc, 1.0), _eye);
+    if (!all(isfinite(p))) return;
+
+    // Pick a point close to the near plane, but not exactly at it/far
+    // tNear = 1% from the near end
+    float zNear = lerp(-1.0, 1.0, 0.01);
+    float3 worldNear = WorldFromClip(float4(ndc.xy, zNear, 1.0), _eye);
+
+    // Build the ray *direction* by unprojecting near and far for this pixel
+    float3 rd = normalize(p - worldNear);
+
+    // Incidence (no camera pos needed)
+    float cosInc = dot(-rd, _PlaneNormal);
+    if (cosInc <= 0.17364817766) return;
+
+    float3 dC = p - _PlaneOrigin;
+    float2 c  = float2(dot(dC, _PlaneRight), dot(dC, _PlaneForward));
+    float  h  = dot(dC, _PlaneNormal);
+
+    float dz_du, dz_dv;
+    dz_du_dv(px, dz_du, dz_dv);
+
+    // Calculate $\partial P / \partial n_z$ (the "ray vector"):
+    // 2) Differential PDN via invVP:
+    //    dp/du = (image-step at const z) + (dz/du) * (dp/dz)
+    float3 dp_dz = dp_dz_center(px, ndc.z, 1e-3);
+    float3 dp_du = dp_du_constZ(px, ndc.z, 1) + dp_dz * dz_du;
+    float3 dp_dv = dp_dv_constZ(px, ndc.z, 1) + dp_dz * dz_dv;
+
+    // Project differentials to plane → columns of J [m/px]
+    float2 a = float2(dot(dp_du, _PlaneRight), dot(dp_du, _PlaneForward));
+    float2 b = float2(dot(dp_dv, _PlaneRight), dot(dp_dv, _PlaneForward));
+
+    // Watertight min-axis clamp before building S, C
+    float minAxis = 0.5 * min(_cellSize.x, _cellSize.y);
+    float la = length(a), lb = length(b);
+    if (la < minAxis) a *= (minAxis / max(la, 1e-12));
+    if (lb < minAxis) b *= (minAxis / max(lb, 1e-12));
+
+    // S = J J^T  (2x2, in m^2/px^2)
+    float aa = dot(a, a);
+    float bb = dot(b, b);
+    float ab = dot(a, b);
+    float detS = aa * bb - ab * ab; // = (det J)^2
+
+    if (detS <= 1e-20) return; // reject degenerate footprint
+
+    // Precision C = (1/τ^2) * S^{-1}   [1/m^2]
+    float invDetS = 1.0 / detS;
+    float2x2 S_inv = float2x2(  bb * invDetS, -ab * invDetS,
+                               -ab * invDetS,  aa * invDetS );
+    float tau = max(_gaussTau, 0.5); // τ in pixels (kernel std in image domain)
+    float2x2 C = S_inv * (1.0 / (tau * tau)); // bake τ into C
+
+    // EWA normalization: 1 / (2π τ |det J|)
+    // invArea=1/(2π τ^2 |detJ|)
+    float detJ_abs = sqrt(detS); // |det J|
+    float invArea  = 1.0 / (2.0 * PI * (tau * tau) * max(detJ_abs, 1e-12));
+
+    // Eigenvalues of S = J J^T  (units m^2/px^2)
+    float tr   = aa + bb;
+    float disc = max(tr * tr - 4.0 * detS, 0.0);
+    float sMaj = 0.5 * (tr + sqrt(disc));
+    float sMin = 0.5 * (tr - sqrt(disc));
+
+    // Radii in meters along principal axes at q = qMax
+    const float qMax = 4.0;  // (~2σ) is a good EWA cutoff
+    float root = sqrt(qMax);
+    float rMaj_m = root * tau * sqrt(max(sMaj, 0.0));  // [m]
+    float rMin_m = root * tau * sqrt(max(sMin, 0.0));  // [m]
+
+    float rMinClamp = 0.5 * min(_cellSize.x, _cellSize.y);  // e.g., half a cell
+    rMaj_m = max(rMaj_m, rMinClamp);
+    rMin_m = max(rMin_m, rMinClamp);
+
+    // Fast reject if the entire ellipse is outside the 1 x 1 m domain
+    // Use a conservative circle test.
+    const float2 HALF = float2(0.5, 0.5);
+    float2 margin = float2(rMaj_m, rMaj_m);
+    if (any(c < -HALF - margin) || any(c > HALF + margin))
+        return; // nothing contributes inside the 1x1 tile
+
+    // Map plane meters -> grid indices (origin-centered)
+    // c in [-0.5, +0.5]  ->  ij in [0, GridSize)
+    float2 ijC = (c + HALF) / _cellSize;   // fractional index of ellipse center
+    int i0 = (int)floor(ijC.x);
+    int j0 = (int)floor(ijC.y);
+
+    // Convert to texel extents (axis-aligned box in grid space)
+    int Rx = (int)ceil(rMaj_m / max(_cellSize.x, 1e-6)) + 1;
+    int Ry = (int)ceil(rMin_m / max(_cellSize.y, 1e-6)) + 1;
+
+    // Clip bbox to [0, W/H)
+    int iMin = max(0,               i0 - Rx);
+    int iMax = min((int)_gridW - 1, i0 + Rx);
+    int jMin = max(0,               j0 - Ry);
+    int jMax = min((int)_gridH - 1, j0 + Ry);
+
+    // Splat, evaluating q(d)=d^T C d in meters
+    const float INV_LN2 = 1.4426950408889634;
+
+    for (int j = jMin; j <= jMax; ++j)
+    {
+        float y_m = (j + 0.5) * _cellSize.y - HALF.y;  // cell center in meters (centered)
+        for (int i = iMin; i <= iMax; ++i)
+        {
+            float x_m = (i + 0.5) * _cellSize.x - HALF.x;
+
+            float2 d = float2(x_m, y_m) - c;    // meters
+
+            // q = d^T C d
+            float q = d.x * (C[0][0] * d.x + C[0][1] * d.y) +
+                      d.y * (C[1][0] * d.x + C[1][1] * d.y);
+            if (q > qMax) continue;
+
+            float w     = exp2(-0.5f * q * INV_LN2);
+            float wNorm = invArea * w * _cellArea;  // discrete ∫ approximation
+
+            uint wfx  = (uint)round(saturate(wNorm) * (float)_wScale);
+            if (wfx == 0u) continue;
+
+            const float k = (float)_hwScale / (float)_wScale;
+            int hwfx = (int)round(h * (float)wfx * k);
+            uint coswfx = (uint)round(cosInc * (float)wfx * k); // accumulate cos
+
+            InterlockedAdd(_AccumW[int2(i, j)], wfx);
+            InterlockedAdd(_AccumHW[int2(i, j)], hwfx);
+            InterlockedAdd(_AccumCosW[int2(i, j)], coswfx);
+        }
+    }
+}
+
+[numthreads(8, 8, 1)]
+void ResolveFuseCS(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x >= _gridW || tid.y >= _gridH) return;
+    int2 ij = tid.xy;
+
+    uint sumW = _AccumW[ij];
+    int  sumHW = _AccumHW[ij];
+
+    float sumW_f = (float)sumW / (float)_wScale;
+    float z_frame = (float)sumHW / max((float)sumW, 1e-9);
+
+    // compute cosAvg, w_support, w_angle, w_frame
+    // and do TSDF update to _HeightMu / _HeightW
+
+    float w_support = saturate(sumW_f); // 0..1
+    float w_frame   = w_support;        // per-frame temporal weight
+
+    float mu = _HeightMu[ij];
+    float W  = _HeightW[ij];
+
+    if (sumW == 0u || w_frame <= 0.0)
+    {
+        // no measurement this frame
+        _HeightMu[ij] = mu;
+        _HeightW[ij]  = W;
+        return;
+    }
+
+    if (W <= 0.0)
+    {
+        _HeightMu[ij] = z_frame;
+        _HeightW[ij]  = w_frame;
+        return;
+    }
+
+    W = clamp(W, 0.0, 30.0);
+    float W_add = w_frame;
+    float W_sum = W + W_add;
+    float W_new = min(W_sum, 30.0);
+
+    float alpha = (W_sum > 0.0) ? (W_add / W_sum) : 1.0;
+    alpha = saturate(alpha);
+
+    float mu_new = lerp(mu, z_frame, alpha);
+
+    _HeightMu[ij] = mu_new;
+    _HeightW[ij]  = W_new;
+}
+
+// StabilityReduceCS
+// Computes:
+//   _Stats[0] = knownCount where _HeightW >= _ConfThresh
+//   _Stats[1] = maxDelta_fp = max(|mu - muPrev| * _DeltaScale) over known cells
+[numthreads(8,8,1)]
+void StabilityReduceCS(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x >= _gridW || tid.y >= _gridH) return;
+
+    // Only consider "known" cells for coverage and delta
+    float W = _HeightW[int2(tid.xy)];
+    if (!(W >= _ConfThresh)) return;
+
+    float mu  = _HeightMu[int2(tid.xy)];
+    float mup = _HeightMuPrev[int2(tid.xy)];
+
+    float d = abs(mu - mup);
+    uint d_fp = (uint)round(d * _DeltaScale);
+
+    InterlockedAdd(_Stats[0], 1u);
+    InterlockedMax(_Stats[1], d_fp);
+}
+
+// Copies current fused mean to previous mean texture
+[numthreads(8,8,1)]
+void CopyHeightMuCS(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x >= _gridW || tid.y >= _gridH) return;
+    _HeightMuPrev[int2(tid.xy)] = _HeightMu[int2(tid.xy)];
+}
